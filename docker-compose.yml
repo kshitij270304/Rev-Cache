@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  coordinator:
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+    command: sh -c "npm install && npx ts-node coordinator.ts"
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+
+  node1:
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+    command: sh -c "npm install && npx ts-node node.ts"
+    environment:
+      - PORT=3001
+      - NODE_ID=node-1
+      - NODE_URL=http://node1:3001
+      - COORDINATOR_URL=http://coordinator:3000
+    depends_on:
+      - coordinator
+
+  node2:
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+    command: sh -c "npm install && npx ts-node node.ts"
+    environment:
+      - PORT=3002
+      - NODE_ID=node-2
+      - NODE_URL=http://node2:3002
+      - COORDINATOR_URL=http://coordinator:3000
+    depends_on:
+      - coordinator
+
+  node3:
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+    command: sh -c "npm install && npx ts-node node.ts"
+    environment:
+      - PORT=3003
+      - NODE_ID=node-3
+      - NODE_URL=http://node3:3003
+      - COORDINATOR_URL=http://coordinator:3000
+    depends_on:
+      - coordinator
