@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package cache;
+
+// The gRPC Service exposed by all Cache Nodes
+service CacheService {
+  rpc Get (GetRequest) returns (GetResponse);
+  rpc Put (PutRequest) returns (PutResponse);
+  rpc Delete (DeleteRequest) returns (DeleteResponse);
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+  rpc SyncData (SyncDataRequest) returns (SyncDataResponse);
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bool found = 1;
+  string value = 2; // JSON stringified payload
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2; // JSON stringified payload
+  int32 ttl = 3;    // Time to live in ms
+}
+
+message PutResponse {
+  bool success = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+}
+
+message HeartbeatRequest {}
+
+message HeartbeatResponse {
+  bool alive = 1;
+  int32 hits = 2;
+  int32 misses = 3;
+  int32 keys = 4;
+}
+
+message SyncDataRequest {}
+
+message CacheItem {
+  string key = 1;
+  string value = 2; // JSON stringified
+  double expiresAt = 3; // Using double for safe JS timestamps (0 for persistent)
+}
+
+message SyncDataResponse {
+  repeated CacheItem items = 1;
+}

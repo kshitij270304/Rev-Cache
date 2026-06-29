@@ -1,97 +1,127 @@
 import express from 'express';
 import axios from 'axios';
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import path from 'path';
 
+// --- CONFIGURATION ---
+const NODE_ID = process.env.NODE_ID || `node-${Math.floor(Math.random() * 1000)}`;
+const REST_PORT = parseInt(process.env.PORT || '3001', 10);
+const GRPC_PORT = REST_PORT + 1000; // Offset gRPC port
+const NODE_URL = process.env.NODE_URL || `http://localhost:${REST_PORT}`;
+const GRPC_URL = process.env.GRPC_URL || `localhost:${GRPC_PORT}`;
+const COORDINATOR_URL = process.env.COORDINATOR_URL || 'http://localhost:3000';
+
+// --- EXPRESS APP (Admin & Simulation only) ---
 const app = express();
 app.use(express.json());
 
-const NODE_ID = process.env.NODE_ID || `node-${Math.floor(Math.random() * 1000)}`;
-const PORT = process.env.PORT || 3001;
-const NODE_URL = process.env.NODE_URL || `http://localhost:${PORT}`;
-const COORDINATOR_URL = process.env.COORDINATOR_URL || 'http://localhost:3000';
-
-// ---------------------------------------------------------
-// IN-MEMORY STORAGE & STATE
-// ---------------------------------------------------------
+// --- IN-MEMORY STORAGE & STATE ---
 interface CacheItem {
     value: any;
     expiresAt: number | null;
 }
 const store = new Map<string, CacheItem>();
 
-let metrics = {
-    hits: 0,
-    misses: 0
-};
+let metrics = { hits: 0, misses: 0 };
+let isCrashed = false; // Crash simulation flag
 
-// Flag to simulate a node crash without killing the actual Docker container
-let isCrashed = false;
-
-// --- Crash Simulation Endpoints ---
+// --- REST Endpoints (Simulation) ---
 app.post('/internal/crash', (req, res) => {
     isCrashed = true;
-    console.log(`[${NODE_ID}] Simulated CRASH activated. Ignoring requests.`);
+    console.log(`[${NODE_ID}] Simulated CRASH activated. gRPC will reject requests.`);
     res.send({ status: 'crashed' });
 });
 
 app.post('/internal/revive', (req, res) => {
     isCrashed = false;
-    console.log(`[${NODE_ID}] Simulated REVIVAL activated. Resuming operations.`);
+    console.log(`[${NODE_ID}] Simulated REVIVAL activated. gRPC resuming.`);
     res.send({ status: 'revived' });
 });
 
 // ---------------------------------------------------------
-// INTERNAL CACHE API (Called by Coordinator)
+// gRPC SERVER IMPLEMENTATION
 // ---------------------------------------------------------
-app.get('/internal/cache/:key', (req, res) => {
-    if (isCrashed) return res.status(503).send({ error: 'Node is down' });
+const PROTO_PATH = path.resolve(__dirname, '../proto/cache.proto');
+const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+    keepCase: true, longs: String, enums: String, defaults: true, oneofs: true
+});
+const cacheProto = grpc.loadPackageDefinition(packageDefinition).cache as any;
 
-    const key = req.params.key;
-    const item = store.get(key);
+const grpcServer = new grpc.Server();
 
-    if (!item) {
-        metrics.misses++;
-        return res.status(404).send({ error: 'Not found' });
+grpcServer.addService(cacheProto.CacheService.service, {
+    Get: (call: any, callback: any) => {
+        if (isCrashed) return callback({ code: grpc.status.UNAVAILABLE, message: 'Node is down' });
+
+        const key = call.request.key;
+        const item = store.get(key);
+
+        if (!item || (item.expiresAt !== null && Date.now() > item.expiresAt)) {
+            if (item) store.delete(key);
+            metrics.misses++;
+            return callback(null, { found: false, value: "" });
+        }
+
+        metrics.hits++;
+        callback(null, { found: true, value: JSON.stringify(item.value) });
+    },
+
+    Put: (call: any, callback: any) => {
+        if (isCrashed) return callback({ code: grpc.status.UNAVAILABLE, message: 'Node is down' });
+
+        const { key, value, ttl } = call.request;
+        const expiresAt = ttl > 0 ? Date.now() + ttl : null;
+        
+        store.set(key, { value: JSON.parse(value), expiresAt });
+        console.log(`[${NODE_ID}] (gRPC) Saved key: ${key}`);
+        
+        callback(null, { success: true });
+    },
+
+    Delete: (call: any, callback: any) => {
+        if (isCrashed) return callback({ code: grpc.status.UNAVAILABLE, message: 'Node is down' });
+        
+        store.delete(call.request.key);
+        callback(null, { success: true });
+    },
+
+    Heartbeat: (call: any, callback: any) => {
+        // We answer the heartbeat regardless, but relay the 'alive' status
+        callback(null, {
+            alive: !isCrashed,
+            hits: metrics.hits,
+            misses: metrics.misses,
+            keys: store.size
+        });
+    },
+
+    SyncData: (call: any, callback: any) => {
+        if (isCrashed) return callback({ code: grpc.status.UNAVAILABLE, message: 'Node is down' });
+
+        const keysDump: Array<{ key: string; value: string; expiresAt: number }> = [];
+        const now = Date.now();
+
+        for (const [key, item] of store.entries()) {
+            if (item.expiresAt === null || now < item.expiresAt) {
+                keysDump.push({
+                    key,
+                    value: JSON.stringify(item.value),
+                    expiresAt: item.expiresAt === null ? 0 : item.expiresAt
+                });
+            } else {
+                store.delete(key);
+            }
+        }
+        callback(null, { items: keysDump });
     }
-
-    // Check TTL (Time To Live)
-    if (item.expiresAt !== null && Date.now() > item.expiresAt) {
-        store.delete(key);
-        metrics.misses++;
-        return res.status(404).send({ error: 'Expired' });
-    }
-
-    metrics.hits++;
-    res.send({ value: item.value });
-});
-
-app.post('/internal/cache/:key', (req, res) => {
-    if (isCrashed) return res.status(503).send({ error: 'Node is down' });
-
-    const key = req.params.key;
-    const { value, ttl } = req.body;
-
-    const expiresAt = ttl ? Date.now() + parseInt(ttl) : null;
-    
-    store.set(key, { value, expiresAt });
-    console.log(`[${NODE_ID}] Saved key: ${key}`);
-    
-    res.send({ status: 'ok' });
-});
-
-app.delete('/internal/cache/:key', (req, res) => {
-    if (isCrashed) return res.status(503).send({ error: 'Node is down' });
-
-    const key = req.params.key;
-    store.delete(key);
-    res.send({ status: 'deleted' });
 });
 
 // ---------------------------------------------------------
-// BACKGROUND TASKS (TTL Cleanup & Heartbeats)
+// STARTUP & BACKGROUND TASKS
 // ---------------------------------------------------------
-
-// TTL Cleanup Task: Runs every 10 seconds to delete expired keys from memory
 setInterval(() => {
+    if (isCrashed) return;
     const now = Date.now();
     for (const [key, item] of store.entries()) {
         if (item.expiresAt !== null && now > item.expiresAt) {
@@ -100,26 +130,18 @@ setInterval(() => {
     }
 }, 10000);
 
-// Heartbeat Task: Sends health and metrics to Coordinator every 3 seconds
-setInterval(async () => {
-    if (isCrashed) return; // Stop sending heartbeats if crashed!
+grpcServer.bindAsync(`0.0.0.0:${GRPC_PORT}`, grpc.ServerCredentials.createInsecure(), () => {
+    console.log(`[${NODE_ID}] gRPC Server running on port ${GRPC_PORT}`);
+    grpcServer.start();
 
-    try {
-        await axios.post(`${COORDINATOR_URL}/api/heartbeat`, {
+    app.listen(REST_PORT, () => {
+        console.log(`[${NODE_ID}] REST Admin running on port ${REST_PORT}`);
+        
+        // One-time registration with Coordinator
+        axios.post(`${COORDINATOR_URL}/api/register`, {
             id: NODE_ID,
-            url: NODE_URL,
-            metrics: {
-                hits: metrics.hits,
-                misses: metrics.misses,
-                keys: store.size
-            }
-        });
-    } catch (error) {
-        console.error(`[${NODE_ID}] Failed to send heartbeat to Coordinator. Retrying...`);
-    }
-}, 3000);
-
-// Start Node
-app.listen(PORT, () => {
-    console.log(`Node ${NODE_ID} starting on port ${PORT}`);
+            url: NODE_URL,       // Admin REST URL
+            grpcUrl: GRPC_URL    // High-speed gRPC URL
+        }).catch(err => console.error(`[${NODE_ID}] Failed to register with coordinator.`));
+    });
 });
